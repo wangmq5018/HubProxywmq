@@ -714,40 +714,66 @@ select_ip_address() {
 }
 
 # 获取 Cloudflare API 和域名信息
-get_cloudflare_info() {
-  echo -e "${BLUE}请输入 Cloudflare API 信息:${NC}"
-
-  while [ -z "$CF_API_TOKEN" ]; do
-    read -p "API Token: " CF_API_TOKEN_INPUT
-    if [ -z "$CF_API_TOKEN_INPUT" ]; then
-      echo -e "${RED}API Token 不能为空${NC}"
-    else
-      CF_API_TOKEN="$CF_API_TOKEN_INPUT"
-    fi
-  done
-
-  while [ -z "$DOMAIN_NAME" ]; do
-    read -p "域名 (例如: hubproxy.example.com): " DOMAIN_NAME_INPUT
-    if [ -z "$DOMAIN_NAME_INPUT" ]; then
-      echo -e "${RED}域名不能为空${NC}"
-    else
-      DOMAIN_NAME="$DOMAIN_NAME_INPUT"
-    fi
-  done
-}
-
 # 获取 Cloudflare Zone ID 信息
 get_cloudflare_zone_id() {
+  echo -e "${BLUE}正在获取 Zone ID...${NC}"
+  
+  # 提取根域名（例如从 hubproxy.example.com 提取 example.com）
+  ROOT_DOMAIN="${DOMAIN_NAME#*.}"
+  
+  # 如果提取后还是完整域名，尝试再次提取（处理二级域名的情况）
+  if [[ "$ROOT_DOMAIN" == "$DOMAIN_NAME" ]] || [[ "$ROOT_DOMAIN" == *.*.* ]]; then
+    ROOT_DOMAIN="${ROOT_DOMAIN#*.}"
+  fi
+  
+  echo -e "${BLUE}使用根域名查询: $ROOT_DOMAIN${NC}"
+  
   if [ "$FETCH_TOOL" == "curl" ]; then
-    CF_ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=${DOMAIN_NAME#*.}" \
+    RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=${ROOT_DOMAIN}" \
       -H "Authorization: Bearer ${CF_API_TOKEN}" \
-      -H "Content-Type: application/json" | jq -r '.result[0].id')
+      -H "Content-Type: application/json")
   else
-    CF_ZONE_ID=$(wget -qO - \
+    RESPONSE=$(wget -qO - \
       --header="Authorization: Bearer ${CF_API_TOKEN}" \
       --header="Content-Type: application/json" \
-      "https://api.cloudflare.com/client/v4/zones?name=${DOMAIN_NAME#*.}" | jq -r '.result[0].id')
+      "https://api.cloudflare.com/client/v4/zones?name=${ROOT_DOMAIN}")
   fi
+
+  # 检查响应是否为空
+  if [ -z "$RESPONSE" ]; then
+    echo -e "${RED}获取 Zone ID 失败: API 无响应${NC}"
+    return 1
+  fi
+
+  # 检查响应是否为有效 JSON
+  if ! echo "$RESPONSE" | jq empty 2>/dev/null; then
+    echo -e "${RED}获取 Zone ID 失败: 无效的 API 响应${NC}"
+    echo -e "${YELLOW}响应内容: $RESPONSE${NC}"
+    return 1
+  fi
+
+  # 检查 API 调用是否成功
+  SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+  if [ "$SUCCESS" != "true" ]; then
+    ERRORS=$(echo "$RESPONSE" | jq -r '.errors[].message' | tr '\n' ' ')
+    echo -e "${RED}获取 Zone ID 失败: $ERRORS${NC}"
+    return 1
+  fi
+
+  # 获取 Zone ID
+  CF_ZONE_ID=$(echo "$RESPONSE" | jq -r '.result[0].id')
+  
+  if [ "$CF_ZONE_ID" = "null" ] || [ -z "$CF_ZONE_ID" ]; then
+    echo -e "${RED}获取 Zone ID 失败: 未找到域名 ${ROOT_DOMAIN} 对应的 Zone${NC}"
+    echo -e "${YELLOW}请检查:${NC}"
+    echo -e "${YELLOW}1. 域名是否正确且已在 Cloudflare 管理${NC}"
+    echo -e "${YELLOW}2. API Token 是否有 Zone.Zone:Read 权限${NC}"
+    echo -e "${YELLOW}3. 域名拼写是否正确${NC}"
+    return 1
+  fi
+
+  echo -e "${GREEN}成功获取 Zone ID: $CF_ZONE_ID${NC}"
+  return 0
 }
 
 # 创建 DNS 记录（不启用代理）
@@ -759,6 +785,18 @@ create_dns_record_without_proxy() {
   if validate_ipv6 "$SELECTED_IP"; then
     RECORD_TYPE="AAAA"
   fi
+
+  # 获取 Cloudflare Zone ID
+  echo -e "${BLUE}获取 Cloudflare Zone ID...${NC}"
+  if ! get_cloudflare_zone_id; then
+    echo -e "${RED}无法获取 Zone ID，请手动输入:${NC}"
+    read -p "请输入 Zone ID: " CF_ZONE_ID
+    if [ -z "$CF_ZONE_ID" ]; then
+      echo -e "${RED}未提供 Zone ID，无法继续${NC}"
+      exit 1
+    fi
+  fi
+
 
   # 获取 Cloudflare 域名 ID
   grep -q '^$' <<< "${CF_ZONE_ID}" && get_cloudflare_zone_id
