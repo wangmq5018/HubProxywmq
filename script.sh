@@ -1,10 +1,14 @@
 #!/bin/bash
 
 # 版本信息
-VERSION="1.0.1"
+VERSION="1.0.2"
 UPDATE_DATE="2025-08-08"
 
 # 更新日志
+# v1.0.2 (2025-08-08)
+# - 修复 Cloudflare API 调用问题
+# - 改进域名解析和 Zone ID 获取逻辑
+# - 增强错误处理和调试信息
 # v1.0.1 (2025-08-08)
 # - 优化 Zone ID 获取方式：通过 API 自动获取，无需用户手动输入
 # - VPS 卸载增强：卸载时可选择是否一并卸载 Caddy，默认保留 Caddy
@@ -714,22 +718,45 @@ select_ip_address() {
 }
 
 # 获取 Cloudflare API 和域名信息
+get_cloudflare_info() {
+  echo -e "${BLUE}请输入 Cloudflare API 信息:${NC}"
+
+  while [ -z "$CF_API_TOKEN" ]; do
+    read -p "API Token: " CF_API_TOKEN_INPUT
+    if [ -z "$CF_API_TOKEN_INPUT" ]; then
+      echo -e "${RED}API Token 不能为空${NC}"
+    else
+      CF_API_TOKEN="$CF_API_TOKEN_INPUT"
+    fi
+  done
+
+  while [ -z "$DOMAIN_NAME" ]; do
+    read -p "域名 (例如: hubproxy.example.com): " DOMAIN_NAME_INPUT
+    if [ -z "$DOMAIN_NAME_INPUT" ]; then
+      echo -e "${RED}域名不能为空${NC}"
+    else
+      DOMAIN_NAME="$DOMAIN_NAME_INPUT"
+    fi
+  done
+}
+
 # 获取 Cloudflare Zone ID 信息
 get_cloudflare_zone_id() {
   echo -e "${BLUE}正在获取 Zone ID...${NC}"
   
-  # 提取根域名（例如从 hubproxy.example.com 提取 example.com）
-  ROOT_DOMAIN="${DOMAIN_NAME#*.}"
-  
-  # 如果提取后还是完整域名，尝试再次提取（处理二级域名的情况）
-  if [[ "$ROOT_DOMAIN" == "$DOMAIN_NAME" ]] || [[ "$ROOT_DOMAIN" == *.*.* ]]; then
-    ROOT_DOMAIN="${ROOT_DOMAIN#*.}"
+  # 提取根域名
+  if [[ "$DOMAIN_NAME" =~ ^[^.]+\.[^.]+$ ]]; then
+    # 一级域名，如 example.com
+    ROOT_DOMAIN="$DOMAIN_NAME"
+  else
+    # 多级域名，提取最后两部分
+    ROOT_DOMAIN=$(echo "$DOMAIN_NAME" | awk -F'.' '{print $(NF-1)"."$NF}')
   fi
   
   echo -e "${BLUE}使用根域名查询: $ROOT_DOMAIN${NC}"
   
   if [ "$FETCH_TOOL" == "curl" ]; then
-    RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=${ROOT_DOMAIN}" \
+    RESPONSE=$(curl -s -w "\n%{http_code}" -X GET "https://api.cloudflare.com/client/v4/zones?name=${ROOT_DOMAIN}" \
       -H "Authorization: Bearer ${CF_API_TOKEN}" \
       -H "Content-Type: application/json")
   else
@@ -739,29 +766,42 @@ get_cloudflare_zone_id() {
       "https://api.cloudflare.com/client/v4/zones?name=${ROOT_DOMAIN}")
   fi
 
+  # 如果是 curl，分离响应体和状态码
+  if [ "$FETCH_TOOL" == "curl" ]; then
+    HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+    RESPONSE_BODY=$(echo "$RESPONSE" | head -n -1)
+  else
+    RESPONSE_BODY="$RESPONSE"
+  fi
+
   # 检查响应是否为空
-  if [ -z "$RESPONSE" ]; then
+  if [ -z "$RESPONSE_BODY" ]; then
     echo -e "${RED}获取 Zone ID 失败: API 无响应${NC}"
     return 1
   fi
 
   # 检查响应是否为有效 JSON
-  if ! echo "$RESPONSE" | jq empty 2>/dev/null; then
+  if ! echo "$RESPONSE_BODY" | jq empty 2>/dev/null; then
     echo -e "${RED}获取 Zone ID 失败: 无效的 API 响应${NC}"
-    echo -e "${YELLOW}响应内容: $RESPONSE${NC}"
+    echo -e "${YELLOW}响应内容: $RESPONSE_BODY${NC}"
     return 1
   fi
 
   # 检查 API 调用是否成功
-  SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+  SUCCESS=$(echo "$RESPONSE_BODY" | jq -r '.success')
   if [ "$SUCCESS" != "true" ]; then
-    ERRORS=$(echo "$RESPONSE" | jq -r '.errors[].message' | tr '\n' ' ')
+    ERRORS=$(echo "$RESPONSE_BODY" | jq -r '.errors[].message' | tr '\n' ' ')
     echo -e "${RED}获取 Zone ID 失败: $ERRORS${NC}"
+    
+    # 显示详细的错误信息
+    if [ "$FETCH_TOOL" == "curl" ]; then
+      echo -e "${YELLOW}HTTP 状态码: $HTTP_CODE${NC}"
+    fi
     return 1
   fi
 
   # 获取 Zone ID
-  CF_ZONE_ID=$(echo "$RESPONSE" | jq -r '.result[0].id')
+  CF_ZONE_ID=$(echo "$RESPONSE_BODY" | jq -r '.result[0].id')
   
   if [ "$CF_ZONE_ID" = "null" ] || [ -z "$CF_ZONE_ID" ]; then
     echo -e "${RED}获取 Zone ID 失败: 未找到域名 ${ROOT_DOMAIN} 对应的 Zone${NC}"
@@ -797,18 +837,17 @@ create_dns_record_without_proxy() {
     fi
   fi
 
-
-  # 获取 Cloudflare 域名 ID
-  grep -q '^$' <<< "${CF_ZONE_ID}" && get_cloudflare_zone_id
-
   # 首先检查是否已存在同名记录
   echo -e "${BLUE}检查是否已存在同名 DNS 记录...${NC}"
+  
+  # 测试 API Token 是否有效
+  echo -e "${BLUE}验证 API Token 权限...${NC}"
+  
   if [ "$FETCH_TOOL" == "curl" ]; then
-    LIST_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${DOMAIN_NAME}" \
+    LIST_RESPONSE=$(curl -s -w "\n%{http_code}" -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${DOMAIN_NAME}" \
       -H "Authorization: Bearer ${CF_API_TOKEN}" \
       -H "Content-Type: application/json")
   else
-    # 使用 wget 发送 GET 请求
     LIST_RESPONSE=$(wget -q \
       --header="Authorization: Bearer ${CF_API_TOKEN}" \
       --header="Content-Type: application/json" \
@@ -816,30 +855,50 @@ create_dns_record_without_proxy() {
       "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${DOMAIN_NAME}")
   fi
 
+  # 如果是 curl，分离响应体和状态码
+  if [ "$FETCH_TOOL" == "curl" ]; then
+    HTTP_CODE=$(echo "$LIST_RESPONSE" | tail -n1)
+    LIST_RESPONSE_BODY=$(echo "$LIST_RESPONSE" | head -n -1)
+  else
+    LIST_RESPONSE_BODY="$LIST_RESPONSE"
+  fi
+
   # 检查API响应是否有效
-  if [ -z "$LIST_RESPONSE" ]; then
+  if [ -z "$LIST_RESPONSE_BODY" ]; then
     echo -e "${RED}无法从Cloudflare API获取响应，请检查网络连接和API凭证${NC}"
     exit 1
   fi
 
   # 验证响应是否为有效的JSON
-  if ! echo "$LIST_RESPONSE" | jq empty 2>/dev/null; then
+  if ! echo "$LIST_RESPONSE_BODY" | jq empty 2>/dev/null; then
     echo -e "${RED}收到无效的API响应${NC}"
-    echo -e "${YELLOW}原始响应内容: $LIST_RESPONSE${NC}"
+    echo -e "${YELLOW}原始响应内容: $LIST_RESPONSE_BODY${NC}"
+    exit 1
+  fi
+
+  # 检查API调用是否成功
+  SUCCESS=$(echo "$LIST_RESPONSE_BODY" | jq -r '.success')
+  if [ "$SUCCESS" != "true" ]; then
+    ERRORS=$(echo "$LIST_RESPONSE_BODY" | jq -r '.errors[].message' | tr '\n' ' ')
+    echo -e "${RED}API Token 验证失败: $ERRORS${NC}"
+    echo -e "${YELLOW}请检查:${NC}"
+    echo -e "${YELLOW}1. API Token 是否正确${NC}"
+    echo -e "${YELLOW}2. API Token 是否有 Zone.DNS:Edit 权限${NC}"
+    echo -e "${YELLOW}3. Zone ID 是否正确${NC}"
     exit 1
   fi
 
   # 检查是否有现有记录
-  RECORD_COUNT=$(echo "$LIST_RESPONSE" | jq -r '.result|length')
+  RECORD_COUNT=$(echo "$LIST_RESPONSE_BODY" | jq -r '.result|length')
 
   # 如果有现有记录，则更新第一条记录
   if [ "$RECORD_COUNT" -gt 0 ]; then
     echo -e "${YELLOW}检测到已存在 DNS 记录，将更新现有记录...${NC}"
-    RECORD_ID=$(echo "$LIST_RESPONSE" | jq -r '.result[0].id')
+    RECORD_ID=$(echo "$LIST_RESPONSE_BODY" | jq -r '.result[0].id')
 
     # 更新现有记录
     if [ "$FETCH_TOOL" == "curl" ]; then
-      RESPONSE=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${RECORD_ID}" \
+      RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${RECORD_ID}" \
         -H "Authorization: Bearer ${CF_API_TOKEN}" \
         -H "Content-Type: application/json" \
         --data '{
@@ -870,7 +929,7 @@ create_dns_record_without_proxy() {
     # 没有现有记录，创建新记录
     echo -e "${BLUE}未检测到现有 DNS 记录，将创建新记录...${NC}"
     if [ "$FETCH_TOOL" == "curl" ]; then
-      RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+      RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
         -H "Authorization: Bearer ${CF_API_TOKEN}" \
         -H "Content-Type: application/json" \
         --data '{
@@ -899,25 +958,33 @@ create_dns_record_without_proxy() {
     fi
   fi
 
+  # 分离响应体和状态码（如果是 curl）
+  if [ "$FETCH_TOOL" == "curl" ]; then
+    HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+    RESPONSE_BODY=$(echo "$RESPONSE" | head -n -1)
+  else
+    RESPONSE_BODY="$RESPONSE"
+  fi
+
   # 验证响应是否有效
-  if [ -z "$RESPONSE" ]; then
+  if [ -z "$RESPONSE_BODY" ]; then
     echo -e "${RED}API请求无响应，请检查网络连接和API凭证${NC}"
     exit 1
   fi
 
   # 验证响应是否为有效的JSON
-  if ! echo "$RESPONSE" | jq empty 2>/dev/null; then
+  if ! echo "$RESPONSE_BODY" | jq empty 2>/dev/null; then
     echo -e "${RED}收到无效的API响应${NC}"
-    echo -e "${YELLOW}原始响应内容: $RESPONSE${NC}"
+    echo -e "${YELLOW}原始响应内容: $RESPONSE_BODY${NC}"
     exit 1
   fi
 
-  SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+  SUCCESS=$(echo "$RESPONSE_BODY" | jq -r '.success')
   if [ "$SUCCESS" = "true" ]; then
-    RECORD_ID=$(echo "$RESPONSE" | jq -r '.result.id')
+    RECORD_ID=$(echo "$RESPONSE_BODY" | jq -r '.result.id')
     echo -e "${GREEN}DNS 记录创建/更新成功，记录ID: $RECORD_ID${NC}"
   else
-    ERRORS=$(echo "$RESPONSE" | jq -r '.errors[].message')
+    ERRORS=$(echo "$RESPONSE_BODY" | jq -r '.errors[].message')
     echo -e "${RED}DNS 记录创建/更新失败: $ERRORS${NC}"
     exit 1
   fi
@@ -1268,7 +1335,12 @@ enable_cloudflare_proxy() {
   echo -e "${BLUE}启用 Cloudflare 代理模式...${NC}"
 
   # 获取 Cloudflare 域名 ID
-  grep -q '^$' <<< "${CF_ZONE_ID}" && get_cloudflare_zone_id
+  if [ -z "$CF_ZONE_ID" ]; then
+    if ! get_cloudflare_zone_id; then
+      echo -e "${RED}无法获取 Zone ID，无法启用代理模式${NC}"
+      return 1
+    fi
+  fi
 
   # 获取 DNS 记录 ID
   if [ "$FETCH_TOOL" == "curl" ]; then
